@@ -1,0 +1,13 @@
+{
+  "appId": "com.estudo.app",
+  "appName": "Estudo",
+  "webDir": "www",
+  "server": {
+    "url": "https://alma-conversation-garden.lovable.app",
+    "cleartext": false
+  },
+  "ios": {
+    "contentInset": "always",
+    "backgroundColor": "#000000"
+  }
+}
