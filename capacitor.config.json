@@ -3,11 +3,15 @@
   "appName": "Prosa Silk",
   "webDir": "www",
   "server": {
-    "url": "https://alma-conversation-garden.lovable.app",
+    "url": "https://alma-conversation-garden.lovable.app/chat",
     "cleartext": false
   },
   "ios": {
     "contentInset": "always",
-    "backgroundColor": "#000000"
+    "backgroundColor": "#000000",
+    "zoomEnabled": false,
+    "preferredContentMode": "mobile",
+    "allowsLinkPreview": false,
+    "scrollingEnabled": true
   }
 }

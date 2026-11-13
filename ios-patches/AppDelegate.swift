@@ -51,52 +51,185 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
 // MARK: - ViewController
 
-// Subclasse direta de CAPBridgeViewController (o Main.storyboard aponta pra ca).
-// capacitorDidLoad() roda ANTES do webview carregar a URL remota, entao da pra
-// registrar o WKUserScript sem corrida com o primeiro load.
+// Subclasse de CAPBridgeViewController (o Main.storyboard aponta pra ca).
+// capacitorDidLoad() roda ANTES do webview carregar a URL, entao da pra:
+//   - ajustar a sensacao nativa (zoom, bounce, gesto de voltar, barra de status)
+//   - registrar o WKUserScript de limpeza de marca + viewport
+//   - subir uma tela de carregamento nativa por cima do webview
 @objc(ViewController)
 class ViewController: CAPBridgeViewController {
 
+    private var loadingOverlay: UIView?
+    private var readyStreak = 0
+    private var pollTimer: Timer?
+    private var overlayShownAt = Date()
+
     override func capacitorDidLoad() {
         super.capacitorDidLoad()
+        guard let webView = self.webView else { return }
 
+        // app e escuro -> barra de status com texto claro (senao some no preto)
+        self.setStatusBarStyle(.lightContent)
+
+        // sensacao nativa
+        webView.allowsBackForwardNavigationGestures = true
+        webView.scrollView.showsVerticalScrollIndicator = false
+        webView.scrollView.showsHorizontalScrollIndicator = false
+        webView.scrollView.bounces = false
+        webView.scrollView.maximumZoomScale = 1.0
+        webView.scrollView.minimumZoomScale = 1.0
+
+        // cache de HTTP maior — os assets do site sao "immutable", entao valem guardar
+        URLCache.shared = URLCache(memoryCapacity: 64 * 1024 * 1024,
+                                   diskCapacity: 512 * 1024 * 1024,
+                                   diskPath: "prosa-http-cache")
+
+        // limpeza de marca + viewport (leve: sem varredura de DOM por mutacao)
         let js = """
         (function(){
-          var CSS = "#lovable-badge,#lovable-badge *,#lovable-badge-cta,[id^='lovable-badge'],[class*='lovable-badge']{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important;width:0!important;height:0!important;min-width:0!important;min-height:0!important;max-width:0!important;max-height:0!important;overflow:hidden!important;position:absolute!important;left:-9999px!important;top:-9999px!important;z-index:-2147483647!important}";
-          function kill(){
+          try{
+            var vp = document.querySelector('meta[name="viewport"]');
+            if(!vp){
+              vp = document.createElement('meta');
+              vp.setAttribute('name','viewport');
+              (document.head||document.documentElement).appendChild(vp);
+            }
+            vp.setAttribute('content','width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no');
+          }catch(e){}
+
+          var CSS = "#lovable-badge,#lovable-badge *,#lovable-badge-cta,[id^='lovable-badge']{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important;width:0!important;height:0!important;min-width:0!important;min-height:0!important;max-width:0!important;max-height:0!important;overflow:hidden!important;position:absolute!important;left:-9999px!important;top:-9999px!important;z-index:-2147483647!important}";
+
+          function apply(){
             try{
               if(!document.getElementById('__prosa_kill')){
                 var s = document.createElement('style');
                 s.id = '__prosa_kill';
                 s.type = 'text/css';
                 s.appendChild(document.createTextNode(CSS));
-                (document.head || document.documentElement).appendChild(s);
+                (document.head||document.documentElement).appendChild(s);
               }
             }catch(e){}
             try{
               var n = document.getElementById('lovable-badge');
               if(n && n.parentNode){ n.parentNode.removeChild(n); }
             }catch(e){}
-            try{
-              var all = document.querySelectorAll('[aria-label],[title],[content],[href]');
-              for(var i=0;i<all.length;i++){
-                var el = all[i];
-                var blob = (el.getAttribute('aria-label')||'') + (el.getAttribute('title')||'') + (el.getAttribute('content')||'') + (el.getAttribute('href')||'');
-                if(/lovable/i.test(blob)){
-                  if(el.tagName === 'META' || el.tagName === 'LINK'){ if(el.parentNode){ el.parentNode.removeChild(el); } }
-                  else { el.style.display = 'none'; el.style.visibility = 'hidden'; }
-                }
-              }
-            }catch(e){}
           }
-          kill();
-          try{ document.addEventListener('DOMContentLoaded', kill); }catch(e){}
-          try{ new MutationObserver(kill).observe(document.documentElement, {childList:true, subtree:true}); }catch(e){}
+
+          // o CSS ja esconde tudo sozinho; o observer so remove o no e e debounced
+          var pending = 0;
+          function schedule(){
+            if(pending){ return; }
+            pending = setTimeout(function(){ pending = 0; apply(); }, 1200);
+          }
+
+          apply();
+          try{ document.addEventListener('DOMContentLoaded', apply); }catch(e){}
+          try{
+            new MutationObserver(schedule).observe(document.documentElement, {childList:true, subtree:true});
+          }catch(e){}
         })();
         """
 
+        webView.configuration.userContentController.addUserScript(
+            WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        )
+
+        installLoadingOverlay()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        loadingOverlay?.frame = self.view.bounds
+    }
+
+    // MARK: - Tela de carregamento nativa
+
+    private func installLoadingOverlay() {
+        let ov = UIView(frame: self.view.bounds)
+        ov.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        ov.backgroundColor = .black
+
+        let logoView = UIImageView(image: ViewController.bundleLogo())
+        logoView.contentMode = .scaleAspectFit
+        logoView.translatesAutoresizingMaskIntoConstraints = false
+
+        let spinner = UIActivityIndicatorView(style: .medium)
+        spinner.color = UIColor(white: 1.0, alpha: 0.7)
+        spinner.startAnimating()
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+
+        ov.addSubview(logoView)
+        ov.addSubview(spinner)
+        NSLayoutConstraint.activate([
+            logoView.centerXAnchor.constraint(equalTo: ov.centerXAnchor),
+            logoView.centerYAnchor.constraint(equalTo: ov.centerYAnchor, constant: -40),
+            logoView.widthAnchor.constraint(equalToConstant: 132),
+            logoView.heightAnchor.constraint(equalToConstant: 132),
+            spinner.centerXAnchor.constraint(equalTo: ov.centerXAnchor),
+            spinner.topAnchor.constraint(equalTo: logoView.bottomAnchor, constant: 28)
+        ])
+
+        self.view.addSubview(ov)
+        self.loadingOverlay = ov
+        self.overlayShownAt = Date()
+        self.readyStreak = 0
+        startPolling()
+    }
+
+    private static func bundleLogo() -> UIImage? {
+        let candidates: [URL?] = [
+            Bundle.main.url(forResource: "logo", withExtension: "png", subdirectory: "public"),
+            Bundle.main.url(forResource: "logo", withExtension: "png")
+        ]
+        for case let url? in candidates {
+            if let data = try? Data(contentsOf: url), let img = UIImage(data: data) {
+                return img
+            }
+        }
+        return nil
+    }
+
+    private func startPolling() {
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            if Date().timeIntervalSince(self.overlayShownAt) > 20 {
+                timer.invalidate()
+                self.hideLoadingOverlay()
+                return
+            }
+            self.probeReady()
+        }
+    }
+
+    private func probeReady() {
         guard let webView = self.webView else { return }
-        let script = WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: false)
-        webView.configuration.userContentController.addUserScript(script)
+        let js = "(function(){try{var b=document.body;if(!b)return 0;if(document.readyState!=='complete')return 0;var t=(b.innerText||'').trim();return t.length>40?1:0;}catch(e){return 0;}})()"
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            guard let self = self else { return }
+            if let n = result as? NSNumber, n.intValue == 1 {
+                self.readyStreak += 1
+            } else {
+                self.readyStreak = 0
+            }
+            if self.readyStreak >= 2 {
+                self.pollTimer?.invalidate()
+                self.hideLoadingOverlay()
+            }
+        }
+    }
+
+    private func hideLoadingOverlay() {
+        guard let ov = self.loadingOverlay else { return }
+        self.loadingOverlay = nil
+        let elapsed = Date().timeIntervalSince(self.overlayShownAt)
+        let delay = max(0.0, 0.45 - elapsed)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            UIView.animate(withDuration: 0.35, animations: {
+                ov.alpha = 0
+            }, completion: { _ in
+                ov.removeFromSuperview()
+            })
+        }
     }
 }
