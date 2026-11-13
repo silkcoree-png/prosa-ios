@@ -44,6 +44,22 @@ jobs:
           grep -c "customClass=\"ViewController\"" ios/App/App/Base.lproj/Main.storyboard
           grep -c "imageView" ios/App/App/Base.lproj/LaunchScreen.storyboard
 
+      - name: patch Info.plist (deep link + acesso a camera)
+        run: |
+          set -e
+          PLIST=ios/App/App/Info.plist
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleURLTypes" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes array" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0 dict" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLName string com.prosasilk.app" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string prosasilk" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSCameraUsageDescription string Tirar a foto da questao pra IA responder." "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :NSCameraUsageDescription Tirar a foto da questao pra IA responder." "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSPhotoLibraryUsageDescription string Escolher uma foto da sua galeria." "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :NSPhotoLibraryUsageDescription Escolher uma foto da sua galeria." "$PLIST"
+          echo "--- Info.plist ---"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes:0:CFBundleURLSchemes:0" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" "$PLIST"
+
       - name: build unsigned .app
         working-directory: ios/App
         run: |

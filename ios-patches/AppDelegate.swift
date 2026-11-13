@@ -1,90 +1,152 @@
+//
+//  AppDelegate.swift
+//  Prosa Silk
+//
+//  Cena nativa do wrapper Capacitor:
+//   - barra de status clara, sem zoom/bounce, cache maior
+//   - overlay de carregamento nativo (logo + spinner)
+//   - corte da marca do hospedeiro no WebView
+//   - deep link prosasilk://foto | prosasilk://galeria -> camera/galeria NATIVA na hora
+//   - gatilho pelos botoes de volume (heuristica: + e - em sequencia rapida)
+//   - cortina preta no app switcher (nao vaza a conversa)
+//
+//  O site exige mesma origem no /api/chat (isSameOrigin), entao o WebView e
+//  OBRIGADO a carregar a URL remota. A camera nativa existe justamente pra
+//  nao depender do site ter carregado.
+//
+
 import UIKit
 import Capacitor
 import WebKit
+import AVFoundation
+import MediaPlayer
+import PhotosUI
 
 @UIApplicationMain
 class AppDelegate: UIResponder, UIApplicationDelegate {
 
     var window: UIWindow?
+    private var curtain: UIView?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Override point for customization after application launch.
+        // app aberto por deep link (cold start): guarda pra ViewController consumir
+        if let url = launchOptions?[.url] as? URL {
+            ViewController.pendingDeepLink = url
+        }
         return true
     }
 
+    // MARK: - Cortina de privacidade (app switcher)
+
     func applicationWillResignActive(_ application: UIApplication) {
-        // Sent when the application is about to move from active to inactive state. This can occur for certain types of temporary interruptions (such as an incoming phone call or SMS message) or when the user quits the application and it begins the transition to the background state.
-        // Use this method to pause ongoing tasks, disable timers, and invalidate graphics rendering callbacks. Games should use this method to pause the game.
-    }
-
-    func applicationDidEnterBackground(_ application: UIApplication) {
-        // Use this method to release shared resources, save user data, invalidate timers, and store enough application state information to restore your application to its current state in case it is terminated later.
-        // If your application supports background execution, this method is called instead of applicationWillTerminate: when the user quits.
-    }
-
-    func applicationWillEnterForeground(_ application: UIApplication) {
-        // Called as part of the transition from the background to the active state; here you can undo many of the changes made on entering the background.
+        guard let window = self.window, curtain == nil else { return }
+        let cover = UIView(frame: window.bounds)
+        cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        cover.backgroundColor = .black
+        let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterialDark))
+        blur.frame = cover.bounds
+        blur.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        cover.addSubview(blur)
+        window.addSubview(cover)
+        curtain = cover
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        // Restart any tasks that were paused (or not yet started) while the application was inactive. If the application was previously in the background, optionally refresh the user interface.
+        guard let cover = curtain else { return }
+        curtain = nil
+        UIView.animate(withDuration: 0.15, animations: { cover.alpha = 0 }) { _ in
+            cover.removeFromSuperview()
+        }
     }
 
-    func applicationWillTerminate(_ application: UIApplication) {
-        // Called when the application is about to terminate. Save data if appropriate. See also applicationDidEnterBackground:.
-    }
+    func applicationDidEnterBackground(_ application: UIApplication) {}
+    func applicationWillEnterForeground(_ application: UIApplication) {}
+    func applicationWillTerminate(_ application: UIApplication) {}
+
+    // MARK: - Deep link
 
     func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
-        // Called when the app was launched with a url. Feel free to add additional processing here,
-        // but if you want the App API to support tracking app url opens, make sure to keep this call
+        if url.scheme?.lowercased() == "prosasilk" {
+            if let root = window?.rootViewController as? ViewController,
+               root.isViewLoaded, root.view.window != nil,
+               root.handleDeepLink(url) {
+                return true
+            }
+            // ainda nao deu pra apresentar: deixa pro primeiro viewDidAppear
+            ViewController.pendingDeepLink = url
+            return true
+        }
         return ApplicationDelegateProxy.shared.application(app, open: url, options: options)
     }
 
     func application(_ application: UIApplication, continue userActivity: NSUserActivity, restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void) -> Bool {
-        // Called when the app was launched with an activity, including Universal Links.
-        // Feel free to add additional processing here, but if you want the App API to support
-        // tracking app url opens, make sure to keep this call
         return ApplicationDelegateProxy.shared.application(application, continue: userActivity, restorationHandler: restorationHandler)
     }
-
 }
 
 // MARK: - ViewController
 
-// Subclasse de CAPBridgeViewController (o Main.storyboard aponta pra ca).
-// capacitorDidLoad() roda ANTES do webview carregar a URL, entao da pra:
-//   - ajustar a sensacao nativa (zoom, bounce, gesto de voltar, barra de status)
-//   - registrar o WKUserScript de limpeza de marca + viewport
-//   - subir uma tela de carregamento nativa por cima do webview
 @objc(ViewController)
 class ViewController: CAPBridgeViewController {
+
+    /// Deep link recebido antes de a tela existir (cold start).
+    static var pendingDeepLink: URL?
 
     private var loadingOverlay: UIView?
     private var readyStreak = 0
     private var pollTimer: Timer?
     private var overlayShownAt = Date()
 
+    // volume
+    private var volumeObservation: NSKeyValueObservation?
+    private var lastVolume: Float = 0
+    private var baselineVolume: Float = 0.5
+    private var lastDirection = 0
+    private var lastChangeAt = Date.distantPast
+    private var volumeView: MPVolumeView?
+    private var lastTriggerAt = Date.distantPast
+
+    // MARK: - Ciclo de vida
+
     override func capacitorDidLoad() {
         super.capacitorDidLoad()
         guard let webView = self.webView else { return }
 
-        // app e escuro -> barra de status com texto claro (senao some no preto)
         self.setStatusBarStyle(.lightContent)
 
-        // sensacao nativa
         webView.allowsBackForwardNavigationGestures = true
         webView.scrollView.showsVerticalScrollIndicator = false
         webView.scrollView.showsHorizontalScrollIndicator = false
         webView.scrollView.bounces = false
+        webView.scrollView.keyboardDismissMode = .interactive
         webView.scrollView.maximumZoomScale = 1.0
         webView.scrollView.minimumZoomScale = 1.0
 
-        // cache de HTTP maior — os assets do site sao "immutable", entao valem guardar
         URLCache.shared = URLCache(memoryCapacity: 64 * 1024 * 1024,
                                    diskCapacity: 512 * 1024 * 1024,
                                    diskPath: "prosa-http-cache")
 
-        // limpeza de marca + viewport (leve: sem varredura de DOM por mutacao)
+        injectScript(webView)
+        installLoadingOverlay()
+        startVolumeWatch()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        if let url = ViewController.pendingDeepLink {
+            ViewController.pendingDeepLink = nil
+            _ = handleDeepLink(url)
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        loadingOverlay?.frame = self.view.bounds
+    }
+
+    // MARK: - Script injetado
+
+    private func injectScript(_ webView: WKWebView) {
         let js = """
         (function(){
           try{
@@ -115,7 +177,6 @@ class ViewController: CAPBridgeViewController {
             }catch(e){}
           }
 
-          // o CSS ja esconde tudo sozinho; o observer so remove o no e e debounced
           var pending = 0;
           function schedule(){
             if(pending){ return; }
@@ -124,22 +185,169 @@ class ViewController: CAPBridgeViewController {
 
           apply();
           try{ document.addEventListener('DOMContentLoaded', apply); }catch(e){}
-          try{
-            new MutationObserver(schedule).observe(document.documentElement, {childList:true, subtree:true});
-          }catch(e){}
+          try{ new MutationObserver(schedule).observe(document.documentElement, {childList:true, subtree:true}); }catch(e){}
         })();
         """
-
         webView.configuration.userContentController.addUserScript(
             WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         )
-
-        installLoadingOverlay()
     }
 
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        loadingOverlay?.frame = self.view.bounds
+    // MARK: - Deep link -> captura nativa
+
+    @discardableResult
+    func handleDeepLink(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "prosasilk" else { return false }
+        let target = ((url.host ?? "") + url.path).lowercased()
+        guard target.contains("foto") || target.contains("galeria") || target.contains("camera") else { return false }
+        let wantsLibrary = target.contains("galeria")
+        DispatchQueue.main.async { [weak self] in
+            self?.presentCapture(library: wantsLibrary)
+        }
+        return true
+    }
+
+    private func presentCapture(library: Bool) {
+        guard presentedViewController == nil else { return }
+        if library || !UIImagePickerController.isSourceTypeAvailable(.camera) {
+            var cfg = PHPickerConfiguration()
+            cfg.filter = .images
+            cfg.selectionLimit = 1
+            let picker = PHPickerViewController(configuration: cfg)
+            picker.delegate = self
+            present(picker, animated: false)
+        } else {
+            let picker = UIImagePickerController()
+            picker.sourceType = .camera
+            picker.cameraCaptureMode = .photo
+            picker.delegate = self
+            present(picker, animated: false)
+        }
+    }
+
+    // MARK: - Entrega da foto pro WebView
+
+    private func deliver(_ image: UIImage) {
+        guard let data = jpegData(from: image) else { return }
+        injectPhoto(data.base64EncodedString(), tries: 0)
+        if data.count > 0 { scheduleAutoSend(tries: 0) }
+    }
+
+    private func jpegData(from image: UIImage, maxDimension: CGFloat = 1400, quality: CGFloat = 0.72) -> Data? {
+        let w = image.size.width, h = image.size.height
+        guard w > 0, h > 0 else { return nil }
+        let scale = min(1, maxDimension / max(w, h))
+        if scale < 1 {
+            let size = CGSize(width: floor(w * scale), height: floor(h * scale))
+            let renderer = UIGraphicsImageRenderer(size: size)
+            let resized = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
+            return resized.jpegData(compressionQuality: quality)
+        }
+        return image.jpegData(compressionQuality: quality)
+    }
+
+    private func injectPhoto(_ b64: String, tries: Int) {
+        guard let webView = self.webView else { return }
+        let js = """
+        (function(b64){
+          try{
+            var inputs = document.querySelectorAll('input[type=file]');
+            if(!inputs.length) return 0;
+            var pick = null;
+            for (var i=0;i<inputs.length;i++){
+              var a = inputs[i].getAttribute('accept')||'';
+              if(a.indexOf('image')>=0){ pick = inputs[i]; if(inputs[i].hasAttribute('capture')) break; }
+            }
+            if(!pick) pick = inputs[0];
+            var bin = atob(b64), len = bin.length, arr = new Uint8Array(len);
+            for (var j=0;j<len;j++) arr[j] = bin.charCodeAt(j);
+            var file = new File([arr], 'foto.jpg', {type:'image/jpeg'});
+            var dt = new DataTransfer();
+            dt.items.add(file);
+            pick.files = dt.files;
+            pick.dispatchEvent(new Event('change', {bubbles:true}));
+            return 1;
+          }catch(e){ return -1; }
+        })("\(b64)")
+        """
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            guard let self = self else { return }
+            if (result as? NSNumber)?.intValue == 1 { return }
+            guard tries < 50 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.injectPhoto(b64, tries: tries + 1) }
+        }
+    }
+
+    private func scheduleAutoSend(tries: Int) {
+        guard let webView = self.webView else { return }
+        let js = """
+        (function(){
+          try{
+            var form = document.querySelector('form');
+            if(!form) return 0;
+            var btn = form.querySelector('button[type=submit]');
+            if(!btn || btn.disabled) return 0;
+            if(!document.querySelector('img[alt="Foto pra enviar"]')) return 0;
+            form.requestSubmit();
+            return 1;
+          }catch(e){ return -1; }
+        })()
+        """
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            webView.evaluateJavaScript(js) { [weak self] result, _ in
+                guard let self = self else { return }
+                if (result as? NSNumber)?.intValue == 1 { return }
+                guard tries < 16 else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { self.scheduleAutoSend(tries: tries + 1) }
+            }
+        }
+    }
+
+    // MARK: - Gatilho pelos botoes de volume
+
+    private func startVolumeWatch() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try? session.setActive(true)
+        baselineVolume = session.outputVolume
+        lastVolume = baselineVolume
+        volumeObservation = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
+            guard let self = self, let v = change.newValue else { return }
+            self.volumeChanged(v)
+        }
+    }
+
+    private func volumeChanged(_ v: Float) {
+        let dir = v > lastVolume + 0.001 ? 1 : (v < lastVolume - 0.001 ? -1 : 0)
+        lastVolume = v
+        guard dir != 0 else { return }
+
+        let now = Date()
+        if dir != lastDirection, now.timeIntervalSince(lastChangeAt) < 0.5 {
+            lastDirection = 0
+            lastChangeAt = .distantPast
+            guard now.timeIntervalSince(lastTriggerAt) > 1.5 else { return }
+            lastTriggerAt = now
+            restoreVolume()
+            DispatchQueue.main.async { [weak self] in self?.presentCapture(library: false) }
+        } else {
+            lastDirection = dir
+            lastChangeAt = now
+        }
+    }
+
+    private func restoreVolume() {
+        if volumeView == nil {
+            let vv = MPVolumeView(frame: CGRect(x: -2000, y: -2000, width: 40, height: 40))
+            self.view.addSubview(vv)
+            volumeView = vv
+        }
+        guard let slider = volumeView?.subviews.compactMap({ $0 as? UISlider }).first else { return }
+        let target = baselineVolume
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            slider.value = target
+            slider.sendActions(for: .touchUpInside)
+        }
     }
 
     // MARK: - Tela de carregamento nativa
@@ -191,7 +399,7 @@ class ViewController: CAPBridgeViewController {
 
     private func startPolling() {
         pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] timer in
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] timer in
             guard let self = self else { timer.invalidate(); return }
             if Date().timeIntervalSince(self.overlayShownAt) > 20 {
                 timer.invalidate()
@@ -223,13 +431,45 @@ class ViewController: CAPBridgeViewController {
         guard let ov = self.loadingOverlay else { return }
         self.loadingOverlay = nil
         let elapsed = Date().timeIntervalSince(self.overlayShownAt)
-        let delay = max(0.0, 0.45 - elapsed)
+        let delay = max(0.0, 0.35 - elapsed)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            UIView.animate(withDuration: 0.35, animations: {
+            UIView.animate(withDuration: 0.3, animations: {
                 ov.alpha = 0
             }, completion: { _ in
                 ov.removeFromSuperview()
             })
+        }
+    }
+}
+
+// MARK: - Pickers
+
+extension ViewController: UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+    func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+        let image = (info[.editedImage] as? UIImage) ?? (info[.originalImage] as? UIImage)
+        picker.dismiss(animated: false) { [weak self] in
+            if let image = image { self?.deliver(image) }
+        }
+    }
+
+    func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+        picker.dismiss(animated: false, completion: nil)
+    }
+}
+
+extension ViewController: PHPickerViewControllerDelegate {
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        guard let provider = results.first?.itemProvider, provider.canLoadObject(ofClass: UIImage.self) else {
+            picker.dismiss(animated: false, completion: nil)
+            return
+        }
+        provider.loadObject(ofClass: UIImage.self) { [weak self] object, _ in
+            let image = object as? UIImage
+            DispatchQueue.main.async {
+                picker.dismiss(animated: false) {
+                    if let image = image { self?.deliver(image) }
+                }
+            }
         }
     }
 }
