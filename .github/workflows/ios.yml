@@ -29,6 +29,19 @@ jobs:
       - name: sync web + config
         run: npx cap sync ios
 
+      - name: apply ios patches (nome, icone, splash, corte do badge)
+        run: |
+          set -e
+          cp ios-patches/AppDelegate.swift ios/App/App/AppDelegate.swift
+          cp ios-patches/Main.storyboard ios/App/App/Base.lproj/Main.storyboard
+          cp ios-assets/AppIcon-512@2x.png  ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png
+          cp ios-assets/splash-2732x2732.png   ios/App/App/Assets.xcassets/Splash.imageset/splash-2732x2732.png
+          cp ios-assets/splash-2732x2732-1.png ios/App/App/Assets.xcassets/Splash.imageset/splash-2732x2732-1.png
+          cp ios-assets/splash-2732x2732-2.png ios/App/App/Assets.xcassets/Splash.imageset/splash-2732x2732-2.png
+          echo "--- conferindo ---"
+          grep -c "class ViewController" ios/App/App/AppDelegate.swift
+          grep -c "customClass=\"ViewController\"" ios/App/App/Base.lproj/Main.storyboard
+
       - name: build unsigned .app
         working-directory: ios/App
         run: |
@@ -53,7 +66,9 @@ jobs:
           cp -R "$APP" Payload/
           zip -qry app.ipa Payload
           ls -la app.ipa
-          unzip -l app.ipa | head -20
+          echo "--- Info.plist ---"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist" || true
 
       - uses: actions/upload-artifact@v4
         with:
